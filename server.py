@@ -11,25 +11,49 @@ from openpyxl.styles import Font, PatternFill
 from PIL import Image
 from catalog import *
 from reports import pdf_report
+import database
+from dotenv import load_dotenv
 
 ROOT=Path(__file__).resolve().parent
+load_dotenv(ROOT / ".env")
 DATA=Path(os.environ.get("LOA_FIRE_DATA", str(Path.home()/"LOA-Fire-Safety-Data")))
-DATA.mkdir(parents=True,exist_ok=True)
 DB=DATA/"fire.sqlite3"
-def connect():
-    db=sqlite3.connect(DB,timeout=15)
-    db.row_factory=sqlite3.Row
-    db.execute("pragma foreign_keys=on")
-    return db
-with connect() as db:
-    db.executescript("""
+SUPABASE_DB_URL = os.getenv("SUPABASE_DB_URL") or os.getenv("DATABASE_URL")
+SCHEMA = """
     create table if not exists users(id integer primary key,email text unique collate nocase,name text,role text,password text);
-    create table if not exists sessions(token text primary key,user integer references users,expires real);
+    create table if not exists sessions(token text primary key,"user" integer references users,expires real);
     create table if not exists records(id integer primary key,module text,ref text unique,asset integer references records,ident text collate nocase,data text,review text,archived integer default 0,revision integer default 1,created text,unique(module,ident));
     create table if not exists files(id integer primary key,record integer references records,name text,type text,category text,author text,created text,bytes blob);
-    create table if not exists audit(id integer primary key,stamp text,user text,module text,action text,ref text,old text,new text);
+    create table if not exists audit(id integer primary key,stamp text,"user" text,module text,action text,ref text,old text,new text);
     create table if not exists batches(id text primary key,owner integer,rows text);
-    """)
+    """
+
+if SUPABASE_DB_URL:
+    import psycopg
+    try:
+        database.initialize(SUPABASE_DB_URL, SCHEMA)
+    except psycopg.Error as exc:
+        raise SystemExit(f"Supabase initialization failed ({type(exc).__name__}). Check the database connection and permissions.") from None
+    INTEGRITY_ERRORS = (sqlite3.IntegrityError, psycopg.IntegrityError)
+    DATABASE_ERRORS = (sqlite3.Error, psycopg.Error)
+else:
+    DATA.mkdir(parents=True, exist_ok=True)
+    with sqlite3.connect(DB) as local_db:
+        local_db.executescript(SCHEMA)
+    local_db.close()
+    INTEGRITY_ERRORS = (sqlite3.IntegrityError,)
+    DATABASE_ERRORS = (sqlite3.Error,)
+
+
+def connect():
+    if SUPABASE_DB_URL:
+        return database.Database(database.connect(SUPABASE_DB_URL), postgres=True)
+    db = sqlite3.connect(DB, timeout=15)
+    db.row_factory = sqlite3.Row
+    db.execute("pragma foreign_keys=on")
+    return database.Database(db, postgres=False)
+
+
 def now():return datetime.now().isoformat(timespec="seconds")
 def natural(v):return [int(t) if i%2 else t.casefold() for i,t in enumerate(re.split(r"(\d+)",v))]
 def check(ok,msg):
@@ -38,19 +62,26 @@ def password(value,salt=None):
     salt=salt or secrets.token_hex(16)
     return salt+":"+hashlib.pbkdf2_hmac("sha256",value.encode(),salt.encode(),420000).hex()
 def event(db,u,m,a,r="",old="",new=""):
-    db.execute("insert into audit(stamp,user,module,action,ref,old,new) values(?,?,?,?,?,?,?)",(now(),u,m,a,r,old,new))
+    db.execute("insert into audit(stamp,\"user\",module,action,ref,old,new) values(?,?,?,?,?,?,?)",(now(),u,m,a,r,old,new))
 def create(db,m,d,asset=None,review="Pending Verification"):
     ident=d.get("FE #") if m=="fe" else d.get("Equipment ID") if m=="equipment" else None
-    n=db.execute("insert into records(module,asset,ident,data,review,created) values(?,?,?,?,?,?)",(m,asset,ident,json.dumps(d),review,now())).lastrowid
+    n=db.insert_record((m,asset,ident,json.dumps(d),review,now()))
     ref=f"LOA-{PREFIX.get(m,m.upper())}-"+("" if m=="fe" else f"{date.today().year}-")+f"{n:04d}"
     db.execute("update records set ref=? where id=?",(ref,n))
     return n,ref
+def json_field(db, field):
+    if db.postgres:
+        return f"(data::jsonb ->> '{field}')"
+    return f"""json_extract(data, '$."{field}"')"""
+
+
 def records(db,m,archived=False):
     rows=[]
+    inspection_date = json_field(db, "Inspection Date")
     for r in db.execute("select id,ref,data,review,revision,archived,created,asset from records where module=? and archived=?",(m,int(archived))):
         obj=dict(r); obj["data"]=json.loads(r["data"])
         if m=="fe":
-            latest=db.execute("select data from records where asset=? and module='inspections' and review='Verified' and archived=0 order by json_extract(data,'$.\u0022Inspection Date\u0022') desc,id desc limit 1",(r["id"],)).fetchone()
+            latest=db.execute(f"select data from records where asset=? and module='inspections' and review='Verified' and archived=0 order by {inspection_date} desc,id desc limit 1",(r["id"],)).fetchone()
             obj["data"]["Equipment Status"]=json.loads(latest[0])["Inspection Result"] if latest else "For Verification"
         rows.append(obj)
     return sorted(rows,key=lambda r:natural(r["data"].get("FE #") or r["ref"]))
@@ -112,20 +143,22 @@ class Handler(BaseHTTPRequestHandler):
                     500,
                 )
             return self.output(content, {"index.html":"text/html; charset=utf-8","app.js":"text/javascript","style.css":"text/css"}[file])
-        db=connect()
         try:
-            with db:
+            db=connect()
+            with db.transaction():
                 body={}
                 if post:
                     check(self.headers.get("X-Local-App")=="fire-safety","Invalid request")
                     length=int(self.headers.get("Content-Length",0));check(0<length<=60_000_000,"Invalid request size")
-                    body=json.loads(self.rfile.read(length));db.execute("begin immediate")
+                    body=json.loads(self.rfile.read(length));db.begin_write()
                 cookie=SimpleCookie(self.headers.get("Cookie",""));token=cookie["loa_fire"].value if "loa_fire" in cookie else ""
-                user=db.execute("select u.* from users u join sessions s on s.user=u.id where s.token=? and s.expires>?",(hashlib.sha256(token.encode()).hexdigest(),time.time())).fetchone()
+                user=db.execute("select u.* from users u join sessions s on s.\"user\"=u.id where s.token=? and s.expires>?",(hashlib.sha256(token.encode()).hexdigest(),time.time())).fetchone()
                 setup=not db.execute("select 1 from users limit 1").fetchone()
-                if endpoint=="/session":return self.output(dict(setup=setup,user=dict(name=user["name"],role=user["role"]) if user else None))
+                if endpoint=="/session":return self.output(dict(setup=setup and not SUPABASE_DB_URL,needs_admin=setup and bool(SUPABASE_DB_URL),user=dict(name=user["name"],role=user["role"]) if user else None))
                 if endpoint=="/login" and post:
-                    if setup:self.add_user(db,body,ROLES[0])
+                    if setup:
+                        check(not SUPABASE_DB_URL, "Ask the administrator to initialize the Supabase account.")
+                        self.add_user(db, body, ROLES[0])
                     u=db.execute("select * from users where email=?",(body["email"].strip(),)).fetchone()
                     check(u and hmac.compare_digest(password(body["password"],u["password"].split(":")[0]),u["password"]),"Invalid email or password")
                     token=secrets.token_urlsafe(32);db.execute("insert into sessions values(?,?,?)",(hashlib.sha256(token.encode()).hexdigest(),u["id"],time.time()+28800))
@@ -259,28 +292,70 @@ class Handler(BaseHTTPRequestHandler):
                             im=Image.open(io.BytesIO(raw));typ=Image.MIME.get(im.format);check(typ in ("image/jpeg","image/png","image/webp"),"Unsupported image");im.verify()
                         db.execute("insert into files(record,name,type,category,author,created,bytes) values(?,?,?,?,?,?,?)",(rid,upload["name"],typ,upload["category"],who,now(),raw));event(db,who,m,"Attach evidence",ref,"",upload["name"])
                     if m=="inspections" and (d["Inspection Result"] in RESULT[1:5] or any(d[k] in COND[1:5]+["Low Pressure","High Pressure","Damaged Gauge"] for k in HEAD[6:14])):
-                        exists=db.execute("select 1 from records where module='capa' and json_extract(data,'$.\u0022Inspection Reference\u0022')=?",(ref,)).fetchone()
+                        inspection_ref = json_field(db, "Inspection Reference")
+                        exists=db.execute(f"select 1 from records where module='capa' and {inspection_ref}=?",(ref,)).fetchone()
                         if not exists:
                             _,c=create(db,"capa",{"Deficiency":d["REMARKS"] or d["Inspection Result"],"Inspection Reference":ref,"FE #":d["FE #"],"LOCATION":d["LOCATION"],"Recommended Action":d["Corrective Action"],"Status":"Open"},asset);event(db,who,"capa","Create from inspection",c)
                 else:raise ValueError("Unknown action")
                 db.commit();return self.output({"id":rid})
-        except sqlite3.IntegrityError:return self.output({"error":"Duplicate identifier or conflicting record. No changes saved."},status=409)
+        except INTEGRITY_ERRORS:return self.output({"error":"Duplicate identifier or conflicting record. No changes saved."},status=409)
+        except DATABASE_ERRORS as exc:
+            self.log_error("Database operation failed (%s)", type(exc).__name__)
+            return self.output({"error":"Database unavailable or operation failed."},status=503)
         except Exception as exc:return self.output({"error":str(exc) or "Unable to process request"},status=400)
-        finally:db.close()
-    def add_user(self,db,b,role):
+
+    @staticmethod
+    def add_user(db,b,role):
         check(role in ROLES and re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+",b["email"].strip()) and b["name"].strip() and len(b["password"])>=12,"Enter name, valid email and at least 12 password characters")
         db.execute("insert into users(email,name,role,password) values(?,?,?,?)",(b["email"].strip(),b["name"].strip(),role,password(b["password"])))
+    def do_HEAD(self):
+        if urlsplit(self.path).path == "/":
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str((ROOT / "index.html").stat().st_size))
+            self.end_headers()
+        else:
+            self.send_error(404)
     def do_GET(self):self.handle_app_request()
     def do_POST(self):self.handle_app_request(True)
 if __name__=="__main__":
     import sys
     import webbrowser
-    port=int(os.getenv("LOA_FIRE_PORT","8765"))
-    address=f"http://127.0.0.1:{port}/"
-    with ThreadingHTTPServer(("127.0.0.1",port),Handler) as http:
-        print(f"Fire Safety Management System: {address}",flush=True)
-        if "--open-browser" in sys.argv:
+    if "--migrate-sqlite" in sys.argv:
+        if not SUPABASE_DB_URL:
+            sys.exit("Set DATABASE_URL or SUPABASE_DB_URL before migrating.")
+        if not DB.is_file():
+            sys.exit("Local fire.sqlite3 was not found. Set LOA_FIRE_DATA to the data directory.")
+        try:
+            counts = database.migrate_sqlite(SUPABASE_DB_URL, DB.resolve())
+        except ValueError as exc:
+            sys.exit(str(exc))
+        except DATABASE_ERRORS as exc:
+            sys.exit(f"Migration failed ({type(exc).__name__}). No records were imported.")
+        print("Migrated " + ", ".join(f"{n} {table}" for table, n in counts.items()))
+        sys.exit(0)
+
+    if "--create-admin" in sys.argv:
+        from getpass import getpass
+
+        with connect().transaction() as db:
+            db.begin_write()
+            if db.execute("select 1 from users limit 1").fetchone():
+                sys.exit("An account already exists. Manage users through the app.")
+            credentials = {"name": input("Administrator name: "),
+                           "email": input("Administrator email: "),
+                           "password": getpass("Administrator password: ")}
+            Handler.add_user(db, credentials, ROLES[0])
+            event(db, credentials["email"].strip(), "users", "Create initial administrator")
+            db.commit()
+        sys.exit("Administrator created.")
+
+    port = int(os.getenv("PORT", os.getenv("LOA_FIRE_PORT", "8765")))
+    # Hosting platforms (Render and similar) scan 0.0.0.0 and inject PORT.
+    host = os.getenv("LOA_FIRE_HOST") or ("0.0.0.0" if os.getenv("PORT") else "127.0.0.1")
+    address = f"http://127.0.0.1:{port}/"
+    with ThreadingHTTPServer((host, port), Handler) as http:
+        print(f"Fire Safety Management System listening on {host}:{port}", flush=True)
+        if "--open-browser" in sys.argv and host == "127.0.0.1":
             webbrowser.open(address)
         http.serve_forever()
-
-

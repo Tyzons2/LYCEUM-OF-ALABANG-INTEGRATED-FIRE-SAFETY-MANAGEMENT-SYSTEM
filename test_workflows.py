@@ -10,14 +10,13 @@ class Workflow(unittest.TestCase):
         self.db=server.DATA / ("qa-"+os.urandom(8).hex()+".sqlite3")
         self.addCleanup(self.db.unlink, missing_ok=True)
         
-        with server.connect() as original:
-            import sqlite3
-            with sqlite3.connect(self.db) as dest:
-                # Copy schema only so test runs never depend on real accounts.
-                for row in original.execute("select sql from sqlite_master where type='table' and name not like 'sqlite_%'"):
-                    dest.execute(row[0])
-            dest.close()
-        self.patch=patch.object(server,"DB",self.db);self.patch.start();self.addCleanup(self.patch.stop)
+        import sqlite3
+        with sqlite3.connect(self.db) as dest:
+            dest.executescript(server.SCHEMA)
+        dest.close()
+        db_patch = patch.multiple(server, DB=self.db, SUPABASE_DB_URL=None)
+        db_patch.start()
+        self.addCleanup(db_patch.stop)
         self.cookie=""
     def call(self,path,data=None,ok=True):
         h=object.__new__(server.Handler);h.path=path
